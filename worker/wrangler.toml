@@ -1,0 +1,7 @@
+name = "mcpsync-install"
+main = "src/index.js"
+compatibility_date = "2025-01-01"
+
+routes = [
+  { pattern = "mcpsync.codegraff.com", custom_domain = true }
+]
