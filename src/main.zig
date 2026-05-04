@@ -23,9 +23,8 @@ const VERSION = "0.0.1";
 
 extern "c" fn isatty(fd: c_int) c_int;
 extern "c" fn write(fd: c_int, ptr: [*]const u8, len: usize) isize;
-extern "c" fn _NSGetArgc() *c_int;
-extern "c" fn _NSGetArgv() *[*][*:0]u8;
 extern "c" fn getenv(name: [*:0]const u8) ?[*:0]const u8;
+
 
 fn posixGetenv(name: []const u8) ?[]const u8 {
     var buf: [128]u8 = undefined;
@@ -72,17 +71,16 @@ const Out = struct {
 // ── Main ──────────────────────────────────────────────────────────────────────
 
 pub fn main(init: std.process.Init.Minimal) !void {
-    _ = init;
     const alloc = std.heap.c_allocator;
     const out = Out{ .alloc = alloc };
     const s = if (isatty(1) != 0) ui.color_on else ui.color_off;
 
-    // Read argv via macOS libc (mirrors codedb cio.argsAlloc pattern)
-    const argc: usize = @intCast(_NSGetArgc().*);
-    const argv_raw = _NSGetArgv();
-    const args = try alloc.alloc([]const u8, argc);
+    // Read argv cross-platform: use the vector from Init.Minimal on all platforms.
+    // On macOS we also have _NSGetArgc/_NSGetArgv but init.args.vector is portable.
+    const argv_vec = init.args.vector;
+    const args = try alloc.alloc([]const u8, argv_vec.len);
     defer alloc.free(args);
-    for (0..argc) |i| args[i] = std.mem.span(argv_raw.*[i]);
+    for (argv_vec, 0..) |ptr, i| args[i] = std.mem.span(ptr);
 
     const cmd = if (args.len >= 2) args[1] else "status";
 
