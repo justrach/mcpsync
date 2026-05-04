@@ -57,8 +57,15 @@ echo "==> Extracting..."
 tar -xzf "$TMP/$ASSET" -C "$TMP"
 
 # ── Install ───────────────────────────────────────────────────────────────────
+# The binary inside the tarball may be named mcpsync-<arch> — find it
+EXTRACTED_BIN="$(find "$TMP" -maxdepth 1 -type f -perm +111 ! -name "*.tar.gz" | head -1)"
+if [[ -z "$EXTRACTED_BIN" ]]; then
+  echo "error: could not find binary in archive" >&2
+  exit 1
+fi
+
 mkdir -p "$INSTALL_DIR"
-cp "$TMP/$BIN_NAME" "$INSTALL_DIR/$BIN_NAME"
+cp "$EXTRACTED_BIN" "$INSTALL_DIR/$BIN_NAME"
 chmod +x "$INSTALL_DIR/$BIN_NAME"
 
 echo "==> Installed to $INSTALL_DIR/$BIN_NAME"
