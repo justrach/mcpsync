@@ -142,7 +142,7 @@ const target_defs = [_]TargetDef{
     .{
         .display_name = "Claude Code",
         .id = "claude",
-        .rel_path = ".claude/settings.json",
+        .rel_path = ".claude.json",
         .style = .claude,
     },
     .{
