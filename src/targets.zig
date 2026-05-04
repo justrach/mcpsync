@@ -187,6 +187,12 @@ const target_defs = [_]TargetDef{
         .rel_path = ".config/opencode/mcp.json",
         .style = .standard,
     },
+    .{
+        .display_name = "Droid",
+        .id = "droid",
+        .rel_path = ".factory/mcp.json",
+        .style = .standard,
+    },
 };
 
 // ── ID helpers ───────────────────────────────────────────────────────────────

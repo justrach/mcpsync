@@ -17,7 +17,7 @@ const targets_mod = @import("targets.zig");
 const ui = @import("ui.zig");
 const fio = @import("fio.zig");
 
-const VERSION = "0.0.1";
+const VERSION = "0.0.2";
 
 // ── Raw-fd stdout writer (mirrors codedb Out pattern) ────────────────────────
 
