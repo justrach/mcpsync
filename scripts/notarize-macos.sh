@@ -102,28 +102,33 @@ if [[ "$ARCH_TAG" == "x86_64" ]]; then
 fi
 
 echo "==> smoke test signed binary"
-set +e
+# For x86_64 cross-compiled on arm64, executing under Rosetta fails after notarytool
+# sets an immutable com.apple.provenance xattr. Use codesign --verify as the smoke test
+# instead of execution — Apple already accepted the submission above.
 if [[ "$ARCH_TAG" == "x86_64" && "$(uname -m)" == "arm64" ]]; then
-  SMOKE_OUT="$(arch -x86_64 "$BIN" 2>&1)"
-  SMOKE_STATUS=$?
+  if ! codesign --verify --deep --strict "$BIN" 2>&1; then
+    echo "notarize-macos.sh: codesign --verify failed on x86_64 binary" >&2
+    exit 1
+  fi
+  echo "  (skipped execution smoke test for x86_64-on-arm64; codesign verified)"
 else
+  set +e
   SMOKE_OUT="$("$BIN" 2>&1)"
   SMOKE_STATUS=$?
-fi
-set -e
-# mcpsync exits 0 with no args (shows status/banner), so accept 0 or 1
-case "$SMOKE_STATUS" in
-  0|1) ;;
-  *)
-    echo "notarize-macos.sh: signed binary smoke test exited $SMOKE_STATUS" >&2
+  set -e
+  case "$SMOKE_STATUS" in
+    0|1) ;;
+    *)
+      echo "notarize-macos.sh: signed binary smoke test exited $SMOKE_STATUS" >&2
+      echo "$SMOKE_OUT" >&2
+      exit 1
+      ;;
+  esac
+  if ! grep -qi "mcpsync\|mcp\|sync" <<<"$SMOKE_OUT"; then
+    echo "notarize-macos.sh: signed binary smoke test did not print expected output" >&2
     echo "$SMOKE_OUT" >&2
     exit 1
-    ;;
-esac
-if ! grep -qi "mcpsync\|mcp\|sync" <<<"$SMOKE_OUT"; then
-  echo "notarize-macos.sh: signed binary smoke test did not print expected output" >&2
-  echo "$SMOKE_OUT" >&2
-  exit 1
+  fi
 fi
 
 echo "==> package $TARBALL"

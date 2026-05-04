@@ -15,8 +15,12 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
-    // codesign on macOS so the binary runs without quarantine prompts
-    if (target.result.os.tag == .macos and builtin.os.tag == .macos) {
+    // Ad-hoc codesign for native macOS builds so the binary runs without quarantine.
+    // Skip when cross-compiling (e.g. building x86_64 on arm64) — the notarize script
+    // handles signing for distribution builds with the real Developer ID.
+    const native_macos = target.result.os.tag == .macos and builtin.os.tag == .macos;
+    const cross_compiling = target.result.cpu.arch != builtin.cpu.arch;
+    if (native_macos and !cross_compiling) {
         const codesign = b.addSystemCommand(&.{ "codesign", "-f", "-s", "-" });
         codesign.addArtifactArg(exe);
         b.getInstallStep().dependOn(&codesign.step);

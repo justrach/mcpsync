@@ -75,12 +75,12 @@ pub fn main(init: std.process.Init.Minimal) !void {
     const out = Out{ .alloc = alloc };
     const s = if (isatty(1) != 0) ui.color_on else ui.color_off;
 
-    // Read argv cross-platform: use the vector from Init.Minimal on all platforms.
-    // On macOS we also have _NSGetArgc/_NSGetArgv but init.args.vector is portable.
-    const argv_vec = init.args.vector;
-    const args = try alloc.alloc([]const u8, argv_vec.len);
-    defer alloc.free(args);
-    for (argv_vec, 0..) |ptr, i| args[i] = std.mem.span(ptr);
+    // Read argv via the iterator API (safe under all optimization levels).
+    var args_list: std.ArrayList([]const u8) = .empty;
+    defer args_list.deinit(alloc);
+    var it = std.process.Args.Iterator.init(init.args);
+    while (it.next()) |arg| try args_list.append(alloc, arg);
+    const args = args_list.items;
 
     const cmd = if (args.len >= 2) args[1] else "status";
 
