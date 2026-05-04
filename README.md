@@ -55,11 +55,11 @@ mcpsync diff
 ## Status table
 
 ```
-  SERVER    Claude Code Cursor      Windsurf    OpenCode    Gemini      Graff       Forge
-  ------------------------------------------------------------------------------------------
-  codedb    ✓ in sync   ✓ in sync   ✓ in sync   ✓ in sync   ✓ in sync   ✓ in sync   ✓ in sync
-  muonry    ✓ in sync   ✓ in sync   ✓ in sync   ✓ in sync   ✓ in sync   ✓ in sync   ✓ in sync
-  deepwiki  ✓ in sync   ✓ in sync   ✓ in sync   ✓ in sync   ✓ in sync   ✓ in sync   ✓ in sync
+  SERVER    Claude Code Cursor      Windsurf    OpenCode    Gemini      Graff       Forge       Factory Droid
+  --------------------------------------------------------------------------------------------------------------
+  codedb    ✓ in sync   ✓ in sync   ✓ in sync   ✓ in sync   ✓ in sync   ✓ in sync   ✓ in sync   ✓ in sync
+  muonry    ✓ in sync   ✓ in sync   ✓ in sync   ✓ in sync   ✓ in sync   ✓ in sync   ✓ in sync   ✓ in sync
+  deepwiki  ✓ in sync   ✓ in sync   ✓ in sync   ✓ in sync   ✓ in sync   ✓ in sync   ✓ in sync   ✓ in sync
 
   Legend:  ✓ in sync  ✗ missing  ~ outdated  · foreign (not managed)
 ```
@@ -93,7 +93,8 @@ mcpsync list
         ├──► ~/.config/opencode/mcp.json    (OpenCode)
         ├──► ~/.gemini/settings.json        (Gemini CLI)
         ├──► ~/codegraff/.mcp.json          (Graff)
-        └──► ~/forge/mcp.json               (Forge)
+        ├──► ~/forge/mcp.json               (Forge)
+        └──► ~/.factory/mcp.json            (Factory Droid)
 ```
 
 Each tool's config is merged surgically — only the `mcpServers` key is replaced. Every other key in the file (hooks, keybindings, theme settings) is round-tripped verbatim. Foreign servers that exist in a tool but not in your source-of-truth are preserved and shown as `· foreign`.
@@ -140,6 +141,7 @@ Each tool's config is merged surgically — only the `mcpServers` key is replace
 | Gemini CLI | `~/.gemini/settings.json` |
 | Graff | `~/codegraff/.mcp.json` |
 | Forge | `~/forge/mcp.json` |
+| Factory Droid | `~/.factory/mcp.json` |
 
 ## Built with
 

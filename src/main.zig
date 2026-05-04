@@ -477,7 +477,7 @@ fn printUsage(out: Out, s: ui.Style) !void {
         \\    {s}--url{s}  <url>              URL for HTTP/SSE transport
         \\
         \\  {s}TOOLS{s}
-        \\    codex, claude, gemini, devin, graff, forge, cursor, windsurf, opencode
+        \\    codex, claude, gemini, devin, graff, forge, cursor, windsurf, opencode, droid
         \\
         \\  {s}EXAMPLES{s}
         \\    mcpsync init
