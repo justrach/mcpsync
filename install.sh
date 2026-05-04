@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # mcpsync installer
-# Usage: curl -fsSL https://raw.githubusercontent.com/justrach/mcpsync/main/install.sh | bash
+# Usage: curl -fsSL https://mcpsync.codegraff.com | bash
 set -euo pipefail
 
 REPO="justrach/mcpsync"

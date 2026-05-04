@@ -25,8 +25,13 @@ Add a server once. Run `mcpsync sync`. Done.
 ## Install
 
 ```bash
-# Build from source (requires Zig 0.16+)
-git clone https://github.com/codegraff/mcpsync
+curl -fsSL https://mcpsync.codegraff.com | bash
+```
+
+Or build from source (requires Zig 0.16+):
+
+```bash
+git clone https://github.com/justrach/mcpsync
 cd mcpsync && zig build -Doptimize=ReleaseFast
 cp zig-out/bin/mcpsync ~/bin/mcpsync
 ```
