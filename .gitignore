@@ -5,3 +5,4 @@ zig-out/
 *.tar.gz
 *.tar.gz.sha256
 dist/
+socials/
