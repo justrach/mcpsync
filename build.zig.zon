@@ -1,0 +1,12 @@
+.{
+    .name = .mcpsync,
+    .fingerprint = 0xdd04506992566b3,
+    .version = "0.1.0",
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{},
+    .paths = .{
+        "src",
+        "build.zig",
+        "build.zig.zon",
+    },
+}
