@@ -1,0 +1,80 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  # ── Linux builds (in CI) ───────────────────────────────────────────────────
+  build-linux:
+    strategy:
+      matrix:
+        include:
+          - arch: x86_64
+            zig_target: x86_64-linux-musl
+          - arch: aarch64
+            zig_target: aarch64-linux-musl
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Build
+        run: zig build -Doptimize=ReleaseFast -Dtarget=${{ matrix.zig_target }}
+
+      - name: Smoke test
+        if: matrix.arch == 'x86_64'
+        run: |
+          OUT="$(./zig-out/bin/mcpsync 2>&1 || true)"
+          echo "$OUT"
+          echo "$OUT" | grep -qi "mcp"
+
+      - name: Package
+        run: |
+          tar -czf mcpsync-${{ matrix.arch }}-linux.tar.gz -C zig-out/bin mcpsync
+          sha256sum mcpsync-${{ matrix.arch }}-linux.tar.gz \
+            > mcpsync-${{ matrix.arch }}-linux.tar.gz.sha256
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: mcpsync-${{ matrix.arch }}-linux
+          path: |
+            mcpsync-${{ matrix.arch }}-linux.tar.gz
+            mcpsync-${{ matrix.arch }}-linux.tar.gz.sha256
+
+  # ── macOS builds uploaded via release job ──────────────────────────────────
+  # macOS binaries are signed and notarized locally with scripts/notarize-macos.sh,
+  # then uploaded as release assets directly. The release job below just waits for
+  # Linux artifacts and creates the GitHub Release; macOS assets are uploaded
+  # separately with `gh release upload`.
+  release:
+    needs: build-linux
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download Linux artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          files: |
+            artifacts/mcpsync-x86_64-linux.tar.gz
+            artifacts/mcpsync-x86_64-linux.tar.gz.sha256
+            artifacts/mcpsync-aarch64-linux.tar.gz
+            artifacts/mcpsync-aarch64-linux.tar.gz.sha256
+            install.sh

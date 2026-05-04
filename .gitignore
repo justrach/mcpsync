@@ -1,0 +1,7 @@
+.zig-cache/
+zig-out/
+*.o
+*.zip
+*.tar.gz
+*.tar.gz.sha256
+dist/
