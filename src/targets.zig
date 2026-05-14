@@ -308,8 +308,25 @@ fn readServers(
             }
             srv.args = try args.toOwnedSlice(alloc);
         };
+        if (obj.object.get("headers")) |v| if (v == .object) {
+            var headers = std.StringHashMap([]const u8).init(alloc);
+            var header_it = v.object.iterator();
+            while (header_it.next()) |header| {
+                const header_value = header.value_ptr.*;
+                if (header_value == .string) {
+                    try headers.put(header.key_ptr.*, header_value.string);
+                }
+            }
+            if (headers.count() > 0) {
+                srv.headers = headers;
+            } else {
+                headers.deinit();
+            }
+        };
 
         try out.append(alloc, try srv.dupe(alloc));
+        alloc.free(srv.args);
+        if (srv.headers) |*headers| headers.deinit();
     }
 }
 
@@ -324,6 +341,9 @@ fn readServersToml(
     var current_name: ?[]const u8 = null;
     var current_cmd: ?[]const u8 = null;
     var current_url: ?[]const u8 = null;
+    var current_transport: ?[]const u8 = null;
+    var current_headers: ?std.StringHashMap([]const u8) = null;
+    defer if (current_headers) |*headers| headers.deinit();
     var current_args: std.ArrayList([]const u8) = .empty;
     defer current_args.deinit(alloc);
 
@@ -335,17 +355,20 @@ fn readServersToml(
         if (std.mem.startsWith(u8, line, "[")) {
             // Flush previous mcp_servers entry
             if (current_name) |name| {
-                var srv = config.Server{ .name = name };
-                srv.command = current_cmd;
-                srv.url = current_url;
-                if (current_args.items.len > 0) {
-                    srv.args = try current_args.toOwnedSlice(alloc);
-                    current_args = .empty;
-                }
-                try out.append(alloc, try srv.dupe(alloc));
+                try appendTomlServer(
+                    alloc,
+                    out,
+                    name,
+                    current_cmd,
+                    current_url,
+                    current_transport,
+                    &current_args,
+                    &current_headers,
+                );
                 current_name = null;
                 current_cmd = null;
                 current_url = null;
+                current_transport = null;
             }
             if (std.mem.startsWith(u8, line, prefix) and line[line.len - 1] == ']') {
                 current_name = line[prefix.len .. line.len - 1];
@@ -364,6 +387,10 @@ fn readServersToml(
                 current_cmd = tomlUnquote(val_raw);
             } else if (std.mem.eql(u8, key, "url")) {
                 current_url = tomlUnquote(val_raw);
+            } else if (std.mem.eql(u8, key, "transport")) {
+                current_transport = tomlUnquote(val_raw);
+            } else if (std.mem.eql(u8, key, "headers")) {
+                try parseTomlHeaders(alloc, val_raw, &current_headers);
             } else if (std.mem.eql(u8, key, "args")) {
                 // args = ["a", "b", "c"]
                 const inner = blk: {
@@ -385,13 +412,66 @@ fn readServersToml(
 
     // Flush last entry
     if (current_name) |name| {
-        var srv = config.Server{ .name = name };
-        srv.command = current_cmd;
-        srv.url = current_url;
-        if (current_args.items.len > 0) {
-            srv.args = try current_args.toOwnedSlice(alloc);
-        }
-        try out.append(alloc, try srv.dupe(alloc));
+        try appendTomlServer(
+            alloc,
+            out,
+            name,
+            current_cmd,
+            current_url,
+            current_transport,
+            &current_args,
+            &current_headers,
+        );
+    }
+}
+
+fn appendTomlServer(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayList(config.Server),
+    name: []const u8,
+    command: ?[]const u8,
+    url: ?[]const u8,
+    transport: ?[]const u8,
+    args: *std.ArrayList([]const u8),
+    headers: *?std.StringHashMap([]const u8),
+) !void {
+    var srv = config.Server{
+        .name = name,
+        .command = command,
+        .url = url,
+        .transport = transport,
+        .headers = headers.*,
+    };
+    if (args.items.len > 0) {
+        srv.args = try args.toOwnedSlice(alloc);
+        args.* = .empty;
+    }
+
+    try out.append(alloc, try srv.dupe(alloc));
+    alloc.free(srv.args);
+    if (srv.headers) |*h| h.deinit();
+    headers.* = null;
+}
+
+fn parseTomlHeaders(
+    alloc: std.mem.Allocator,
+    value: []const u8,
+    headers_opt: *?std.StringHashMap([]const u8),
+) !void {
+    const trimmed = std.mem.trim(u8, value, " \t");
+    if (trimmed.len < 2 or trimmed[0] != '{' or trimmed[trimmed.len - 1] != '}') return;
+
+    if (headers_opt.* == null) headers_opt.* = std.StringHashMap([]const u8).init(alloc);
+    const inner = trimmed[1 .. trimmed.len - 1];
+    var pairs = std.mem.splitScalar(u8, inner, ',');
+    while (pairs.next()) |pair| {
+        const pair_trimmed = std.mem.trim(u8, pair, " \t");
+        if (pair_trimmed.len == 0) continue;
+        const eq = std.mem.indexOfScalar(u8, pair_trimmed, '=') orelse continue;
+        const key = tomlUnquote(std.mem.trim(u8, pair_trimmed[0..eq], " \t"));
+        const header_value = tomlUnquote(std.mem.trim(u8, pair_trimmed[eq + 1 ..], " \t"));
+        if (key.len == 0) continue;
+        if (headers_opt.*) |*headers| try headers.put(key, header_value);
     }
 }
 
@@ -514,10 +594,31 @@ fn mergeTomlMcpServers(alloc: std.mem.Allocator, doc: []const u8, servers: []con
             }
             try out.appendSlice(alloc, "]\n");
         }
+        if (s.headers) |headers| try appendTomlHeaders(alloc, &out, headers);
+        if (s.transport) |t| {
+            try out.print(alloc, "transport = \"{s}\"\n", .{t});
+        }
     }
     try out.append(alloc, '\n');
 
     return out.toOwnedSlice(alloc);
+}
+
+fn appendTomlHeaders(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayList(u8),
+    headers: std.StringHashMap([]const u8),
+) !void {
+    if (headers.count() == 0) return;
+
+    try out.appendSlice(alloc, "headers = { ");
+    var it = headers.iterator();
+    var i: usize = 0;
+    while (it.next()) |entry| : (i += 1) {
+        if (i > 0) try out.appendSlice(alloc, ", ");
+        try out.print(alloc, "\"{s}\" = \"{s}\"", .{ entry.key_ptr.*, entry.value_ptr.* });
+    }
+    try out.appendSlice(alloc, " }\n");
 }
 
 /// Write mcpServers JSON.  Windsurf uses slightly different field names for some
@@ -527,35 +628,83 @@ fn writeMcpServersForTarget(writer: anytype, servers: []const config.Server, tar
     try writer.writeAll("{\n");
     for (servers, 0..) |s, i| {
         const comma: []const u8 = if (i + 1 < servers.len) "," else "";
-        try writer.print("    \"{s}\": {{\n", .{s.name});
-        if (s.command) |cmd| {
-            try writer.print("      \"command\": \"{s}\"", .{jsonEscape(cmd)});
-            if (s.args.len > 0 or s.url != null) try writer.writeAll(",\n") else try writer.writeAll("\n");
-        }
-        if (s.url) |u| {
-            try writer.print("      \"url\": \"{s}\"", .{jsonEscape(u)});
-            try writer.writeAll("\n");
-        }
-        if (s.args.len > 0) {
-            try writer.writeAll("      \"args\": [");
-            for (s.args, 0..) |a, ai| {
-                const ac: []const u8 = if (ai + 1 < s.args.len) ", " else "";
-                try writer.print("\"{s}\"{s}", .{ jsonEscape(a), ac });
-            }
-            try writer.writeAll("]\n");
-        }
+        try writer.writeAll("    ");
+        try writeJsonString(writer, s.name);
+        try writer.writeAll(": {\n");
+
+        var wrote_field = false;
+        if (s.command) |cmd| try writeJsonStringField(writer, "command", cmd, &wrote_field);
+        if (s.url) |u| try writeJsonStringField(writer, "url", u, &wrote_field);
+        if (s.args.len > 0) try writeJsonStringArrayField(writer, "args", s.args, &wrote_field);
+        if (s.headers) |headers| try writeJsonHeadersField(writer, "headers", headers, &wrote_field);
+        if (s.transport) |t| try writeJsonStringField(writer, "transport", t, &wrote_field);
+        if (wrote_field) try writer.writeByte('\n');
+
         try writer.print("    }}{s}\n", .{comma});
     }
     try writer.writeAll("  }");
 }
 
-/// Minimal JSON string escaper (handles backslash and double-quote).
-fn jsonEscape(s: []const u8) []const u8 {
-    // Fast path: no special chars (almost always true for file paths)
-    for (s) |c| {
-        if (c == '"' or c == '\\') return s; // punt — rare case
+fn writeJsonFieldPrefix(writer: anytype, name: []const u8, wrote_field: *bool) !void {
+    if (wrote_field.*) try writer.writeAll(",\n");
+    try writer.writeAll("      ");
+    try writeJsonString(writer, name);
+    try writer.writeAll(": ");
+    wrote_field.* = true;
+}
+
+fn writeJsonStringField(writer: anytype, name: []const u8, value: []const u8, wrote_field: *bool) !void {
+    try writeJsonFieldPrefix(writer, name, wrote_field);
+    try writeJsonString(writer, value);
+}
+
+fn writeJsonStringArrayField(writer: anytype, name: []const u8, values: []const []const u8, wrote_field: *bool) !void {
+    try writeJsonFieldPrefix(writer, name, wrote_field);
+    try writer.writeByte('[');
+    for (values, 0..) |value, i| {
+        if (i > 0) try writer.writeAll(", ");
+        try writeJsonString(writer, value);
     }
-    return s;
+    try writer.writeByte(']');
+}
+
+fn writeJsonHeadersField(writer: anytype, name: []const u8, headers: std.StringHashMap([]const u8), wrote_field: *bool) !void {
+    if (headers.count() == 0) return;
+    try writeJsonFieldPrefix(writer, name, wrote_field);
+    try writer.writeAll("{\n");
+
+    var it = headers.iterator();
+    var i: usize = 0;
+    while (it.next()) |entry| : (i += 1) {
+        if (i > 0) try writer.writeAll(",\n");
+        try writer.writeAll("        ");
+        try writeJsonString(writer, entry.key_ptr.*);
+        try writer.writeAll(": ");
+        try writeJsonString(writer, entry.value_ptr.*);
+    }
+    try writer.writeAll("\n      }");
+}
+
+fn writeJsonString(writer: anytype, value: []const u8) !void {
+    const hex = "0123456789abcdef";
+    try writer.writeByte('"');
+    for (value) |c| {
+        switch (c) {
+            '"' => try writer.writeAll("\\\""),
+            '\\' => try writer.writeAll("\\\\"),
+            '\n' => try writer.writeAll("\\n"),
+            '\r' => try writer.writeAll("\\r"),
+            '\t' => try writer.writeAll("\\t"),
+            else => if (c < 0x20) {
+                try writer.writeAll("\\u00");
+                try writer.writeByte(hex[c >> 4]);
+                try writer.writeByte(hex[c & 0x0f]);
+            } else {
+                try writer.writeByte(c);
+            },
+        }
+    }
+    try writer.writeByte('"');
 }
 
 /// Replace or insert the value for `key` in a JSON object document.

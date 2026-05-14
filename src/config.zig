@@ -25,20 +25,37 @@ pub const Server = struct {
     command: ?[]const u8 = null,
     /// stdio transport: argument list
     args: []const []const u8 = &.{},
-    /// HTTP/SSE transport: URL
+    /// HTTP/SSE/streamable HTTP transport: URL
     url: ?[]const u8 = null,
-    /// Optional explicit transport hint (e.g. "stdio", "sse")
+    /// Optional per-server HTTP headers, e.g. Authorization tokens.
+    headers: ?std.StringHashMap([]const u8) = null,
+    /// Optional explicit transport hint (e.g. "stdio", "sse", "http")
     transport: ?[]const u8 = null,
 
     pub fn dupe(self: Server, alloc: std.mem.Allocator) !Server {
         var s = self;
         s.name = try alloc.dupe(u8, self.name);
+        s.headers = null;
         if (self.command) |c| s.command = try alloc.dupe(u8, c);
         if (self.url) |u| s.url = try alloc.dupe(u8, u);
         if (self.transport) |t| s.transport = try alloc.dupe(u8, t);
         const args_copy = try alloc.alloc([]const u8, self.args.len);
         for (self.args, 0..) |a, i| args_copy[i] = try alloc.dupe(u8, a);
         s.args = args_copy;
+        if (self.headers) |headers| {
+            var headers_copy = std.StringHashMap([]const u8).init(alloc);
+            errdefer freeHeaderMap(&headers_copy, alloc);
+
+            var it = headers.iterator();
+            while (it.next()) |entry| {
+                const key = try alloc.dupe(u8, entry.key_ptr.*);
+                errdefer alloc.free(key);
+                const value = try alloc.dupe(u8, entry.value_ptr.*);
+                errdefer alloc.free(value);
+                try headers_copy.put(key, value);
+            }
+            s.headers = headers_copy;
+        }
         return s;
     }
 
@@ -47,21 +64,29 @@ pub const Server = struct {
         if (self.command) |c| alloc.free(c);
         if (self.url) |u| alloc.free(u);
         if (self.transport) |t| alloc.free(t);
+        if (self.headers) |*headers| freeHeaderMap(headers, alloc);
         for (self.args) |a| alloc.free(a);
         alloc.free(self.args);
     }
 
-    /// Two servers are "equivalent" if their command/url/args match.
-    /// transport is intentionally excluded — it's a Devin-internal hint
-    /// not written to target tool configs.
+    /// Two servers are "equivalent" if their command/url/args, effective
+    /// transport, and HTTP headers match.
     pub fn eql(self: Server, other: Server) bool {
         if (!strEql(self.command, other.command)) return false;
         if (!strEql(self.url, other.url)) return false;
+        if (!std.mem.eql(u8, self.effectiveTransport(), other.effectiveTransport())) return false;
+        if (!headersEql(self.headers, other.headers)) return false;
         if (self.args.len != other.args.len) return false;
         for (self.args, other.args) |a, b| {
             if (!std.mem.eql(u8, a, b)) return false;
         }
         return true;
+    }
+
+    pub fn effectiveTransport(self: Server) []const u8 {
+        if (self.transport) |t| return t;
+        if (self.url != null) return "sse";
+        return "stdio";
     }
 
     fn strEql(a: ?[]const u8, b: ?[]const u8) bool {
@@ -70,6 +95,34 @@ pub const Server = struct {
         return std.mem.eql(u8, a.?, b.?);
     }
 };
+
+fn freeHeaderMap(headers: *std.StringHashMap([]const u8), alloc: std.mem.Allocator) void {
+    var it = headers.iterator();
+    while (it.next()) |entry| {
+        alloc.free(entry.key_ptr.*);
+        alloc.free(entry.value_ptr.*);
+    }
+    headers.deinit();
+}
+
+fn headerCount(headers: ?std.StringHashMap([]const u8)) usize {
+    if (headers) |h| return h.count();
+    return 0;
+}
+
+fn headersEql(a: ?std.StringHashMap([]const u8), b: ?std.StringHashMap([]const u8)) bool {
+    if (headerCount(a) != headerCount(b)) return false;
+    if (headerCount(a) == 0) return true;
+
+    var a_headers = a orelse return false;
+    const b_headers = b orelse return false;
+    var it = a_headers.iterator();
+    while (it.next()) |entry| {
+        const other_value = b_headers.get(entry.key_ptr.*) orelse return false;
+        if (!std.mem.eql(u8, entry.value_ptr.*, other_value)) return false;
+    }
+    return true;
+}
 
 /// The in-memory registry of all source-of-truth servers.
 pub const Registry = struct {
@@ -177,8 +230,25 @@ fn parseRegistry(alloc: std.mem.Allocator, text: []const u8) !Registry {
             }
             srv.args = try list.toOwnedSlice(alloc);
         };
+        if (obj.object.get("headers")) |v| if (v == .object) {
+            var headers = std.StringHashMap([]const u8).init(alloc);
+            var header_it = v.object.iterator();
+            while (header_it.next()) |header| {
+                const header_value = header.value_ptr.*;
+                if (header_value == .string) {
+                    try headers.put(header.key_ptr.*, header_value.string);
+                }
+            }
+            if (headers.count() > 0) {
+                srv.headers = headers;
+            } else {
+                headers.deinit();
+            }
+        };
 
         try reg.add(srv);
+        alloc.free(srv.args);
+        if (srv.headers) |*headers| headers.deinit();
     }
 
     return reg;
@@ -207,30 +277,81 @@ fn writeMcpServers(writer: anytype, reg: *const Registry) !void {
     try writer.writeAll("{\n");
     for (reg.servers.items, 0..) |s, i| {
         const comma: []const u8 = if (i + 1 < reg.servers.items.len) "," else "";
-        try writer.print("    \"{s}\": {{\n", .{s.name});
-        if (s.command) |cmd| {
-            try writer.print("      \"command\": \"{s}\"", .{cmd});
-            if (s.args.len > 0 or s.transport != null) try writer.writeAll(",\n") else try writer.writeAll("\n");
-        }
-        if (s.url) |u| {
-            try writer.print("      \"url\": \"{s}\"", .{u});
-            if (s.transport != null) try writer.writeAll(",\n") else try writer.writeAll("\n");
-        }
-        if (s.args.len > 0) {
-            try writer.writeAll("      \"args\": [");
-            for (s.args, 0..) |a, ai| {
-                const ac: []const u8 = if (ai + 1 < s.args.len) ", " else "";
-                try writer.print("\"{s}\"{s}", .{ a, ac });
-            }
-            try writer.writeAll("]");
-            if (s.transport != null) try writer.writeAll(",\n") else try writer.writeAll("\n");
-        }
-        if (s.transport) |t| {
-            try writer.print("      \"transport\": \"{s}\"\n", .{t});
-        }
+        try writer.writeAll("    ");
+        try writeJsonString(writer, s.name);
+        try writer.writeAll(": {\n");
+
+        var wrote_field = false;
+        if (s.command) |cmd| try writeJsonStringField(writer, "command", cmd, &wrote_field);
+        if (s.url) |u| try writeJsonStringField(writer, "url", u, &wrote_field);
+        if (s.args.len > 0) try writeJsonStringArrayField(writer, "args", s.args, &wrote_field);
+        if (s.headers) |headers| try writeJsonHeadersField(writer, "headers", headers, &wrote_field);
+        if (s.transport) |t| try writeJsonStringField(writer, "transport", t, &wrote_field);
+        if (wrote_field) try writer.writeByte('\n');
+
         try writer.print("    }}{s}\n", .{comma});
     }
     try writer.writeAll("  }");
 }
 
+fn writeJsonFieldPrefix(writer: anytype, name: []const u8, wrote_field: *bool) !void {
+    if (wrote_field.*) try writer.writeAll(",\n");
+    try writer.writeAll("      ");
+    try writeJsonString(writer, name);
+    try writer.writeAll(": ");
+    wrote_field.* = true;
+}
 
+fn writeJsonStringField(writer: anytype, name: []const u8, value: []const u8, wrote_field: *bool) !void {
+    try writeJsonFieldPrefix(writer, name, wrote_field);
+    try writeJsonString(writer, value);
+}
+
+fn writeJsonStringArrayField(writer: anytype, name: []const u8, values: []const []const u8, wrote_field: *bool) !void {
+    try writeJsonFieldPrefix(writer, name, wrote_field);
+    try writer.writeByte('[');
+    for (values, 0..) |value, i| {
+        if (i > 0) try writer.writeAll(", ");
+        try writeJsonString(writer, value);
+    }
+    try writer.writeByte(']');
+}
+
+fn writeJsonHeadersField(writer: anytype, name: []const u8, headers: std.StringHashMap([]const u8), wrote_field: *bool) !void {
+    if (headers.count() == 0) return;
+    try writeJsonFieldPrefix(writer, name, wrote_field);
+    try writer.writeAll("{\n");
+
+    var it = headers.iterator();
+    var i: usize = 0;
+    while (it.next()) |entry| : (i += 1) {
+        if (i > 0) try writer.writeAll(",\n");
+        try writer.writeAll("        ");
+        try writeJsonString(writer, entry.key_ptr.*);
+        try writer.writeAll(": ");
+        try writeJsonString(writer, entry.value_ptr.*);
+    }
+    try writer.writeAll("\n      }");
+}
+
+fn writeJsonString(writer: anytype, value: []const u8) !void {
+    const hex = "0123456789abcdef";
+    try writer.writeByte('"');
+    for (value) |c| {
+        switch (c) {
+            '"' => try writer.writeAll("\\\""),
+            '\\' => try writer.writeAll("\\\\"),
+            '\n' => try writer.writeAll("\\n"),
+            '\r' => try writer.writeAll("\\r"),
+            '\t' => try writer.writeAll("\\t"),
+            else => if (c < 0x20) {
+                try writer.writeAll("\\u00");
+                try writer.writeByte(hex[c >> 4]);
+                try writer.writeByte(hex[c & 0x0f]);
+            } else {
+                try writer.writeByte(c);
+            },
+        }
+    }
+    try writer.writeByte('"');
+}
