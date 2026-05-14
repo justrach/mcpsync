@@ -25,7 +25,6 @@ extern "c" fn isatty(fd: c_int) c_int;
 extern "c" fn write(fd: c_int, ptr: [*]const u8, len: usize) isize;
 extern "c" fn getenv(name: [*:0]const u8) ?[*:0]const u8;
 
-
 fn posixGetenv(name: []const u8) ?[]const u8 {
     var buf: [128]u8 = undefined;
     if (name.len >= buf.len) return null;
@@ -295,13 +294,16 @@ fn cmdList(alloc: std.mem.Allocator, out: Out, s: ui.Style) !void {
 
 fn cmdAdd(alloc: std.mem.Allocator, out: Out, s: ui.Style, raw_args: []const []const u8) !void {
     if (raw_args.len == 0) {
-        try ui.printError(out, s, "Usage: mcpsync add <name> --cmd <path> [--args a b ...] [--url <url>]", .{});
+        try ui.printError(out, s, "Usage: mcpsync add <name> --cmd <path> [--args a b ...] [--url <url>] [--header 'K: V'] [--transport sse|http]", .{});
         std.process.exit(1);
     }
 
     const name = raw_args[0];
     var cmd_path: ?[]const u8 = null;
     var url: ?[]const u8 = null;
+    var transport: ?[]const u8 = null;
+    var headers: ?std.StringHashMap([]const u8) = null;
+    defer if (headers) |*h| h.deinit();
     var arg_list: std.ArrayList([]const u8) = .empty;
     defer arg_list.deinit(alloc);
 
@@ -322,6 +324,24 @@ fn cmdAdd(alloc: std.mem.Allocator, out: Out, s: ui.Style, raw_args: []const []c
                 std.process.exit(1);
             }
             url = raw_args[i];
+        } else if (std.mem.eql(u8, a, "--transport") or std.mem.eql(u8, a, "-t")) {
+            i += 1;
+            if (i >= raw_args.len) {
+                try ui.printError(out, s, "--transport requires a value", .{});
+                std.process.exit(1);
+            }
+            transport = raw_args[i];
+        } else if (std.mem.eql(u8, a, "--header") or std.mem.eql(u8, a, "-H")) {
+            i += 1;
+            if (i >= raw_args.len) {
+                try ui.printError(out, s, "--header requires a value", .{});
+                std.process.exit(1);
+            }
+            const header = parseHeader(raw_args[i]) orelse {
+                try ui.printError(out, s, "--header must be in the form 'Name: Value'", .{});
+                std.process.exit(1);
+            };
+            try putHeader(alloc, &headers, header.name, header.value);
         } else if (std.mem.eql(u8, a, "--args") or std.mem.eql(u8, a, "-a")) {
             i += 1;
             while (i < raw_args.len and !std.mem.startsWith(u8, raw_args[i], "--")) : (i += 1) {
@@ -338,17 +358,37 @@ fn cmdAdd(alloc: std.mem.Allocator, out: Out, s: ui.Style, raw_args: []const []c
         try ui.printError(out, s, "Provide either --cmd <path> or --url <url>", .{});
         std.process.exit(1);
     }
+    if (headers != null and url == null) {
+        try ui.printError(out, s, "--header requires --url <url>", .{});
+        std.process.exit(1);
+    }
+    if (transport) |t| {
+        if (!isValidTransport(t)) {
+            try ui.printError(out, s, "--transport must be one of: stdio, sse, http", .{});
+            std.process.exit(1);
+        }
+        if (std.mem.eql(u8, t, "stdio") and cmd_path == null) {
+            try ui.printError(out, s, "--transport stdio requires --cmd <path>", .{});
+            std.process.exit(1);
+        }
+        if ((std.mem.eql(u8, t, "sse") or std.mem.eql(u8, t, "http")) and url == null) {
+            try ui.printError(out, s, "--transport {s} requires --url <url>", .{t});
+            std.process.exit(1);
+        }
+    }
 
     var reg = try config.load(alloc);
     defer reg.deinit();
 
+    const selected_transport = transport orelse if (url != null) "sse" else "stdio";
     const existed = reg.get(name) != null;
     const srv = config.Server{
         .name = name,
         .command = cmd_path,
         .url = url,
         .args = arg_list.items,
-        .transport = if (url != null) "sse" else "stdio",
+        .headers = headers,
+        .transport = selected_transport,
     };
     try reg.add(srv);
     try config.save(alloc, &reg);
@@ -360,6 +400,35 @@ fn cmdAdd(alloc: std.mem.Allocator, out: Out, s: ui.Style, raw_args: []const []c
     }
     try out.writeByte('\n');
     try cmdSync(alloc, out, s, &.{});
+}
+
+const HeaderArg = struct {
+    name: []const u8,
+    value: []const u8,
+};
+
+fn parseHeader(raw: []const u8) ?HeaderArg {
+    const sep = std.mem.indexOfScalar(u8, raw, ':') orelse return null;
+    const name = std.mem.trim(u8, raw[0..sep], " \t");
+    if (name.len == 0) return null;
+    const value = std.mem.trim(u8, raw[sep + 1 ..], " \t");
+    return .{ .name = name, .value = value };
+}
+
+fn putHeader(
+    alloc: std.mem.Allocator,
+    headers_opt: *?std.StringHashMap([]const u8),
+    name: []const u8,
+    value: []const u8,
+) !void {
+    if (headers_opt.* == null) headers_opt.* = std.StringHashMap([]const u8).init(alloc);
+    if (headers_opt.*) |*headers| try headers.put(name, value);
+}
+
+fn isValidTransport(transport: []const u8) bool {
+    return std.mem.eql(u8, transport, "stdio") or
+        std.mem.eql(u8, transport, "sse") or
+        std.mem.eql(u8, transport, "http");
 }
 
 // ── remove ────────────────────────────────────────────────────────────────────
@@ -461,7 +530,8 @@ fn printUsage(out: Out, s: ui.Style) !void {
         s.bold, s.reset,
         s.dim,  s.reset,
         s.bold, s.reset,
-        s.cyan, s.reset, s.dim, s.reset,
+        s.cyan, s.reset,
+        s.dim,  s.reset,
         s.cyan, s.reset,
         s.cyan, s.reset,
         s.cyan, s.reset,
@@ -472,12 +542,14 @@ fn printUsage(out: Out, s: ui.Style) !void {
     });
     try out.print(
         \\  {s}ADD FLAGS{s}
-        \\    {s}--cmd{s}  <path>             Path to the MCP server binary
-        \\    {s}--args{s} <a> [<b> ...]      Arguments passed to the binary
-        \\    {s}--url{s}  <url>              URL for HTTP/SSE transport
+        \\    {s}--cmd{s}       <path>        Path to the MCP server binary
+        \\    {s}--args{s}      <a> [<b> ...] Arguments passed to the binary
+        \\    {s}--url{s}       <url>         URL for HTTP/SSE transport
+        \\    {s}--header{s}    <"K: V">     HTTP header for URL servers (repeatable)
+        \\    {s}--transport{s} <type>        stdio, sse, or http (URL default: sse)
         \\
         \\  {s}TOOLS{s}
-        \\    codex, claude, gemini, devin, graff, forge, cursor, windsurf, opencode
+        \\    codex, claude, gemini, devin, graff, forge, cursor, windsurf, opencode, droid
         \\
         \\  {s}EXAMPLES{s}
         \\    mcpsync init
@@ -486,6 +558,7 @@ fn printUsage(out: Out, s: ui.Style) !void {
         \\    mcpsync diff graff
         \\    mcpsync add myserver --cmd ~/bin/myserver --args mcp
         \\    mcpsync add remotemcp --url https://mcp.example.com/mcp
+        \\    mcpsync add remotemcp --url https://mcp.example.com/mcp --transport http --header "Authorization: Bearer <token>"
         \\    mcpsync remove myserver
         \\
         \\  {s}SOURCE OF TRUTH{s}
@@ -497,6 +570,8 @@ fn printUsage(out: Out, s: ui.Style) !void {
         s.cyan, s.reset, // --cmd
         s.cyan, s.reset, // --args
         s.cyan, s.reset, // --url
+        s.cyan, s.reset, // --header
+        s.cyan, s.reset, // --transport
         s.bold, s.reset, // TOOLS
         s.bold, s.reset, // EXAMPLES
         s.bold, s.reset, // SOURCE OF TRUTH
