@@ -624,7 +624,7 @@ fn appendTomlHeaders(
 /// Write mcpServers JSON.  Windsurf uses slightly different field names for some
 /// servers; we normalise on the way out.
 fn writeMcpServersForTarget(writer: anytype, servers: []const config.Server, target_id: []const u8) !void {
-    _ = target_id; // future: per-tool field name overrides
+    const is_claude = std.mem.eql(u8, target_id, "claude");
     try writer.writeAll("{\n");
     for (servers, 0..) |s, i| {
         const comma: []const u8 = if (i + 1 < servers.len) "," else "";
@@ -633,11 +633,20 @@ fn writeMcpServersForTarget(writer: anytype, servers: []const config.Server, tar
         try writer.writeAll(": {\n");
 
         var wrote_field = false;
+        // Claude Code uses "type" instead of "transport" for URL-based servers
+        if (is_claude and s.url != null) {
+            const t = s.effectiveTransport();
+            if (std.mem.eql(u8, t, "sse") or std.mem.eql(u8, t, "http")) {
+                try writeJsonStringField(writer, "type", t, &wrote_field);
+            }
+        }
         if (s.command) |cmd| try writeJsonStringField(writer, "command", cmd, &wrote_field);
         if (s.url) |u| try writeJsonStringField(writer, "url", u, &wrote_field);
         if (s.args.len > 0) try writeJsonStringArrayField(writer, "args", s.args, &wrote_field);
         if (s.headers) |headers| try writeJsonHeadersField(writer, "headers", headers, &wrote_field);
-        if (s.transport) |t| try writeJsonStringField(writer, "transport", t, &wrote_field);
+        if (!is_claude) {
+            if (s.transport) |t| try writeJsonStringField(writer, "transport", t, &wrote_field);
+        }
         if (wrote_field) try writer.writeByte('\n');
 
         try writer.print("    }}{s}\n", .{comma});
