@@ -371,7 +371,12 @@ fn readServersToml(
                 current_transport = null;
             }
             if (std.mem.startsWith(u8, line, prefix) and line[line.len - 1] == ']') {
-                current_name = line[prefix.len .. line.len - 1];
+                var name = line[prefix.len .. line.len - 1];
+                // Strip quotes from [mcp_servers."name with spaces"]
+                if (name.len >= 2 and name[0] == '"' and name[name.len - 1] == '"') {
+                    name = name[1 .. name.len - 1];
+                }
+                current_name = name;
             }
             continue;
         }
@@ -550,6 +555,13 @@ pub fn syncTarget(
 
 /// Splice [mcp_servers.*] TOML sections: remove all existing ones, append new ones.
 /// Every other line in the file is preserved verbatim.
+fn needsTomlQuoting(name: []const u8) bool {
+    for (name) |c| {
+        if (c == ' ' or c == '.' or c == '"' or c == '\'' or c == '[' or c == ']') return true;
+    }
+    return false;
+}
+
 fn mergeTomlMcpServers(alloc: std.mem.Allocator, doc: []const u8, servers: []const config.Server) ![]const u8 {
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(alloc);
@@ -563,7 +575,7 @@ fn mergeTomlMcpServers(alloc: std.mem.Allocator, doc: []const u8, servers: []con
         const line = std.mem.trim(u8, raw_line, "\r");
         if (std.mem.startsWith(u8, std.mem.trimStart(u8, line, &[_]u8{ ' ', '\t' }), "[")) {
             // Any new section header ends a previous mcp block
-            if (std.mem.startsWith(u8, std.mem.trimStart(u8, line, &[_]u8{ ' ', '\t' }), prefix)) {
+            if (std.mem.startsWith(u8, std.mem.trimStart(u8, line, &[_]u8{ ' ', '\t' }), prefix) or std.mem.startsWith(u8, std.mem.trimStart(u8, line, &[_]u8{ ' ', '\t' }), "[mcp_servers.\"")) {
                 in_mcp_block = true;
                 continue;
             }
@@ -579,7 +591,11 @@ fn mergeTomlMcpServers(alloc: std.mem.Allocator, doc: []const u8, servers: []con
     out.shrinkRetainingCapacity(trimmed.len);
 
     for (servers) |s| {
-        try out.print(alloc, "\n[mcp_servers.{s}]\n", .{s.name});
+        if (needsTomlQuoting(s.name)) {
+            try out.print(alloc, "\n[mcp_servers.\"{s}\"]\n", .{s.name});
+        } else {
+            try out.print(alloc, "\n[mcp_servers.{s}]\n", .{s.name});
+        }
         if (s.command) |cmd| {
             try out.print(alloc, "command = \"{s}\"\n", .{cmd});
         }
