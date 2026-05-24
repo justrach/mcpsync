@@ -17,7 +17,7 @@ const targets_mod = @import("targets.zig");
 const ui = @import("ui.zig");
 const fio = @import("fio.zig");
 
-const VERSION = "0.0.3";
+const VERSION = "0.0.4";
 
 // ── Raw-fd stdout writer (mirrors codedb Out pattern) ────────────────────────
 
@@ -108,6 +108,10 @@ pub fn main(init: std.process.Init.Minimal) !void {
         try cmdAdd(alloc, out, s, args[2..]);
     } else if (std.mem.eql(u8, cmd, "remove") or std.mem.eql(u8, cmd, "rm")) {
         try cmdRemove(alloc, out, s, args[2..]);
+    } else if (std.mem.eql(u8, cmd, "update")) {
+        try cmdUpdate(alloc, out, s, args[2..]);
+    } else if (std.mem.eql(u8, cmd, "export")) {
+        try cmdExport(alloc, out, s);
     } else if (std.mem.eql(u8, cmd, "init")) {
         try cmdInit(alloc, out, s);
     } else if (args.len <= 1) {
@@ -381,6 +385,9 @@ fn cmdAdd(alloc: std.mem.Allocator, out: Out, s: ui.Style, raw_args: []const []c
     defer reg.deinit();
 
     const selected_transport = transport orelse if (url != null) "sse" else "stdio";
+    if (transport == null and url != null) {
+        try ui.printInfo(out, s, "Defaulting to {s}sse{s} transport. Pass {s}--transport http{s} for Streamable HTTP.", .{ s.bold, s.reset, s.bold, s.reset });
+    }
     const existed = reg.get(name) != null;
     const srv = config.Server{
         .name = name,
@@ -508,6 +515,179 @@ fn cmdInit(alloc: std.mem.Allocator, out: Out, s: ui.Style) !void {
     try out.writeByte('\n');
 }
 
+// ── update ────────────────────────────────────────────────────────────────────
+
+fn cmdUpdate(alloc: std.mem.Allocator, out: Out, s: ui.Style, raw_args: []const []const u8) !void {
+    if (raw_args.len == 0) {
+        try ui.printError(out, s, "Usage: mcpsync update <name> [--url <url>] [--cmd <path>] [--args a b ...] [--header 'K: V'] [--transport <type>]", .{});
+        std.process.exit(1);
+    }
+
+    const name = raw_args[0];
+    var cmd_path: ?[]const u8 = null;
+    var url: ?[]const u8 = null;
+    var transport_flag: ?[]const u8 = null;
+    var headers: ?std.StringHashMap([]const u8) = null;
+    defer if (headers) |*h| h.deinit();
+    var arg_list: ?std.ArrayList([]const u8) = null;
+    defer if (arg_list) |*a| a.deinit(alloc);
+
+    var i: usize = 1;
+    while (i < raw_args.len) : (i += 1) {
+        const a = raw_args[i];
+        if (std.mem.eql(u8, a, "--cmd") or std.mem.eql(u8, a, "-c")) {
+            i += 1;
+            if (i >= raw_args.len) {
+                try ui.printError(out, s, "--cmd requires a value", .{});
+                std.process.exit(1);
+            }
+            cmd_path = raw_args[i];
+        } else if (std.mem.eql(u8, a, "--url") or std.mem.eql(u8, a, "-u")) {
+            i += 1;
+            if (i >= raw_args.len) {
+                try ui.printError(out, s, "--url requires a value", .{});
+                std.process.exit(1);
+            }
+            url = raw_args[i];
+        } else if (std.mem.eql(u8, a, "--transport") or std.mem.eql(u8, a, "-t")) {
+            i += 1;
+            if (i >= raw_args.len) {
+                try ui.printError(out, s, "--transport requires a value", .{});
+                std.process.exit(1);
+            }
+            transport_flag = raw_args[i];
+        } else if (std.mem.eql(u8, a, "--header") or std.mem.eql(u8, a, "-H")) {
+            i += 1;
+            if (i >= raw_args.len) {
+                try ui.printError(out, s, "--header requires a value", .{});
+                std.process.exit(1);
+            }
+            const header = parseHeader(raw_args[i]) orelse {
+                try ui.printError(out, s, "--header must be in the form 'Name: Value'", .{});
+                std.process.exit(1);
+            };
+            try putHeader(alloc, &headers, header.name, header.value);
+        } else if (std.mem.eql(u8, a, "--args") or std.mem.eql(u8, a, "-a")) {
+            arg_list = std.ArrayList([]const u8).empty;
+            i += 1;
+            while (i < raw_args.len and !std.mem.startsWith(u8, raw_args[i], "--")) : (i += 1) {
+                try arg_list.?.append(alloc, raw_args[i]);
+            }
+            i -%= 1;
+        } else {
+            try ui.printError(out, s, "Unknown flag: {s}", .{a});
+            std.process.exit(1);
+        }
+    }
+
+    if (transport_flag) |t| {
+        if (!isValidTransport(t)) {
+            try ui.printError(out, s, "--transport must be one of: stdio, sse, http", .{});
+            std.process.exit(1);
+        }
+    }
+
+    var reg = try config.load(alloc);
+    defer reg.deinit();
+
+    const srv = reg.getMut(name) orelse {
+        try ui.printError(out, s, "Server '{s}' not found in source of truth", .{name});
+        std.process.exit(1);
+    };
+
+    // Patch individual fields
+    if (cmd_path) |c| {
+        if (srv.command) |old| alloc.free(old);
+        srv.command = try alloc.dupe(u8, c);
+    }
+    if (url) |u| {
+        if (srv.url) |old| alloc.free(old);
+        srv.url = try alloc.dupe(u8, u);
+    }
+    if (transport_flag) |t| {
+        if (srv.transport) |old| alloc.free(old);
+        srv.transport = try alloc.dupe(u8, t);
+    }
+    if (headers) |h| {
+        if (srv.headers) |*old| {
+            freeHeaderMap(old, alloc);
+        }
+        // Dupe the headers into the registry's allocator
+        var new_headers = std.StringHashMap([]const u8).init(alloc);
+        var it = h.iterator();
+        while (it.next()) |entry| {
+            const key = try alloc.dupe(u8, entry.key_ptr.*);
+            const value = try alloc.dupe(u8, entry.value_ptr.*);
+            try new_headers.put(key, value);
+        }
+        srv.headers = new_headers;
+    }
+    if (arg_list) |al| {
+        for (srv.args) |old_arg| alloc.free(old_arg);
+        alloc.free(srv.args);
+        const new_args = try alloc.alloc([]const u8, al.items.len);
+        for (al.items, 0..) |arg, idx| new_args[idx] = try alloc.dupe(u8, arg);
+        srv.args = new_args;
+    }
+
+    try config.save(alloc, &reg);
+    try ui.printSuccess(out, s, "Updated {s}{s}{s} in source of truth", .{ s.bold, name, s.reset });
+    try out.writeByte('\n');
+    try cmdSync(alloc, out, s, &.{});
+}
+
+fn freeHeaderMap(headers: *std.StringHashMap([]const u8), alloc: std.mem.Allocator) void {
+    var it = headers.iterator();
+    while (it.next()) |entry| {
+        alloc.free(entry.key_ptr.*);
+        alloc.free(entry.value_ptr.*);
+    }
+    headers.deinit();
+}
+
+// ── export ────────────────────────────────────────────────────────────────────
+
+fn cmdExport(alloc: std.mem.Allocator, out: Out, s: ui.Style) !void {
+    try ui.printBanner(out, s, VERSION);
+
+    var reg = try config.load(alloc);
+    defer reg.deinit();
+
+    if (reg.servers.items.len == 0) {
+        try ui.printInfo(out, s, "No servers configured.", .{});
+        return;
+    }
+
+    try out.print("  {s}# mcpsync export — regenerate commands{s}\n", .{ s.dim, s.reset });
+    for (reg.servers.items) |srv| {
+        try out.print("  mcpsync add {s}", .{srv.name});
+
+        if (srv.url) |u| {
+            try out.print(" --url {s}", .{u});
+        }
+        if (srv.command) |c| {
+            try out.print(" --cmd {s}", .{c});
+        }
+        if (srv.args.len > 0) {
+            try out.writeAll(" --args");
+            for (srv.args) |a| {
+                try out.print(" {s}", .{a});
+            }
+        }
+        if (srv.transport) |t| {
+            try out.print(" --transport {s}", .{t});
+        }
+        if (srv.headers) |hdrs| {
+            var it = hdrs.iterator();
+            while (it.next()) |entry| {
+                try out.print(" --header \"{s}: {s}\"", .{ entry.key_ptr.*, entry.value_ptr.* });
+            }
+        }
+        try out.writeByte('\n');
+    }
+    try out.writeByte('\n');
+}
+
 // ── usage ─────────────────────────────────────────────────────────────────────
 
 fn printUsage(out: Out, s: ui.Style) !void {
@@ -524,6 +704,8 @@ fn printUsage(out: Out, s: ui.Style) !void {
         \\    {s}init{s}                      Bootstrap ~/.mcpconfig.json from existing tools
         \\    {s}add{s} <name> [flags]        Add or update a server in source of truth
         \\    {s}remove{s} <name>             Remove a server from source of truth
+        \\    {s}update{s} <name> [flags]     Update fields on an existing server
+        \\    {s}export{s}                    Print shell commands to recreate config
         \\    {s}help{s}                      Show this message
         \\
     , .{
@@ -532,6 +714,8 @@ fn printUsage(out: Out, s: ui.Style) !void {
         s.bold, s.reset,
         s.cyan, s.reset,
         s.dim,  s.reset,
+        s.cyan, s.reset,
+        s.cyan, s.reset,
         s.cyan, s.reset,
         s.cyan, s.reset,
         s.cyan, s.reset,

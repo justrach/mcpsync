@@ -145,6 +145,13 @@ pub const Registry = struct {
         return null;
     }
 
+    pub fn getMut(self: *Registry, name: []const u8) ?*Server {
+        for (self.servers.items) |*s| {
+            if (std.mem.eql(u8, s.name, name)) return s;
+        }
+        return null;
+    }
+
     pub fn add(self: *Registry, server: Server) !void {
         // replace if name already exists
         for (self.servers.items) |*s| {
