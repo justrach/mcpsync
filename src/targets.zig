@@ -636,8 +636,10 @@ fn writeMcpServersForTarget(writer: anytype, servers: []const config.Server, tar
         // Claude Code uses "type" instead of "transport" for URL-based servers
         if (is_claude and s.url != null) {
             const t = s.effectiveTransport();
-            if (std.mem.eql(u8, t, "sse") or std.mem.eql(u8, t, "http")) {
-                try writeJsonStringField(writer, "type", t, &wrote_field);
+            // Claude Code recognizes "http" and "streamable-http" but not "sse" in JSON config
+            const claude_type = if (std.mem.eql(u8, t, "sse")) "http" else t;
+            if (std.mem.eql(u8, claude_type, "http") or std.mem.eql(u8, claude_type, "streamable-http")) {
+                try writeJsonStringField(writer, "type", claude_type, &wrote_field);
             }
         }
         if (s.command) |cmd| try writeJsonStringField(writer, "command", cmd, &wrote_field);
