@@ -188,7 +188,7 @@ const target_defs = [_]TargetDef{
         .style = .standard,
     },
     .{
-        .display_name = "Droid",
+        .display_name = "Factory Droid",
         .id = "droid",
         .rel_path = ".factory/mcp.json",
         .style = .standard,
