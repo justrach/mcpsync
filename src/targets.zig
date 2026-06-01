@@ -323,10 +323,26 @@ fn readServers(
                 headers.deinit();
             }
         };
+        if (obj.object.get("env")) |v| if (v == .object) {
+            var env = std.StringHashMap([]const u8).init(alloc);
+            var env_it = v.object.iterator();
+            while (env_it.next()) |env_entry| {
+                const ev = env_entry.value_ptr.*;
+                if (ev == .string) {
+                    try env.put(env_entry.key_ptr.*, ev.string);
+                }
+            }
+            if (env.count() > 0) {
+                srv.env = env;
+            } else {
+                env.deinit();
+            }
+        };
 
         try out.append(alloc, try srv.dupe(alloc));
         alloc.free(srv.args);
         if (srv.headers) |*headers| headers.deinit();
+        if (srv.env) |*env| env.deinit();
     }
 }
 
@@ -344,8 +360,13 @@ fn readServersToml(
     var current_transport: ?[]const u8 = null;
     var current_headers: ?std.StringHashMap([]const u8) = null;
     defer if (current_headers) |*headers| headers.deinit();
+    var current_env: ?std.StringHashMap([]const u8) = null;
+    defer if (current_env) |*env| env.deinit();
     var current_args: std.ArrayList([]const u8) = .empty;
     defer current_args.deinit(alloc);
+    // True while inside a `[mcp_servers.NAME.env]` sub-table of the pending
+    // server — its `KEY = "val"` lines are env vars, not a new server.
+    var in_env_subtable = false;
 
     var lines = std.mem.splitScalar(u8, text, '\n');
     while (lines.next()) |raw_line| {
@@ -353,7 +374,30 @@ fn readServersToml(
 
         // New section header
         if (std.mem.startsWith(u8, line, "[")) {
-            // Flush previous mcp_servers entry
+            // Parse the mcp_servers section name (unquoted) if this is one.
+            var section: ?[]const u8 = null;
+            if (std.mem.startsWith(u8, line, prefix) and line.len > prefix.len and line[line.len - 1] == ']') {
+                var nm = line[prefix.len .. line.len - 1];
+                if (nm.len >= 2 and nm[0] == '"' and nm[nm.len - 1] == '"') nm = nm[1 .. nm.len - 1];
+                section = nm;
+            }
+
+            // `[mcp_servers.PARENT.env]` belonging to the pending server: route
+            // its key/values into that server's env instead of flushing a new
+            // (transport-less) server. This is how Codex stores env vars, and
+            // mis-reading it as a server is what corrupted configs before.
+            if (section) |nm| {
+                if (std.mem.endsWith(u8, nm, ".env")) {
+                    const parent = nm[0 .. nm.len - 4];
+                    if (current_name != null and std.mem.eql(u8, parent, current_name.?)) {
+                        in_env_subtable = true;
+                        continue; // keep building the pending server
+                    }
+                }
+            }
+
+            // Any other section ends the pending server — flush it (with env).
+            in_env_subtable = false;
             if (current_name) |name| {
                 try appendTomlServer(
                     alloc,
@@ -364,19 +408,37 @@ fn readServersToml(
                     current_transport,
                     &current_args,
                     &current_headers,
+                    &current_env,
                 );
                 current_name = null;
                 current_cmd = null;
                 current_url = null;
                 current_transport = null;
             }
-            if (std.mem.startsWith(u8, line, prefix) and line[line.len - 1] == ']') {
-                var name = line[prefix.len .. line.len - 1];
-                // Strip quotes from [mcp_servers."name with spaces"]
-                if (name.len >= 2 and name[0] == '"' and name[name.len - 1] == '"') {
-                    name = name[1 .. name.len - 1];
+
+            if (section) |nm| {
+                // A dotted `.env`/`.headers` tail is a sub-table, never a server —
+                // skip it so we never emit a phantom transport-less server (the
+                // bug this fix removes). Real servers may legitimately contain a
+                // dot, but never end in these reserved sub-table suffixes.
+                if (std.mem.endsWith(u8, nm, ".env") or std.mem.endsWith(u8, nm, ".headers")) {
+                    current_name = null;
+                } else {
+                    current_name = nm;
                 }
-                current_name = name;
+            }
+            continue;
+        }
+
+        // Lines inside a `[mcp_servers.NAME.env]` sub-table: KEY = "value".
+        if (in_env_subtable) {
+            if (std.mem.indexOfScalar(u8, line, '=')) |eq| {
+                const key = tomlUnquote(std.mem.trim(u8, line[0..eq], " \t"));
+                const val = tomlUnquote(std.mem.trim(u8, line[eq + 1 ..], " \t"));
+                if (key.len > 0) {
+                    if (current_env == null) current_env = std.StringHashMap([]const u8).init(alloc);
+                    if (current_env) |*env| try env.put(key, val);
+                }
             }
             continue;
         }
@@ -396,6 +458,9 @@ fn readServersToml(
                 current_transport = tomlUnquote(val_raw);
             } else if (std.mem.eql(u8, key, "headers")) {
                 try parseTomlHeaders(alloc, val_raw, &current_headers);
+            } else if (std.mem.eql(u8, key, "env")) {
+                // Inline form: env = { "KEY" = "value", ... }
+                try parseTomlHeaders(alloc, val_raw, &current_env);
             } else if (std.mem.eql(u8, key, "args")) {
                 // args = ["a", "b", "c"]
                 const inner = blk: {
@@ -426,6 +491,7 @@ fn readServersToml(
             current_transport,
             &current_args,
             &current_headers,
+            &current_env,
         );
     }
 }
@@ -439,6 +505,7 @@ fn appendTomlServer(
     transport: ?[]const u8,
     args: *std.ArrayList([]const u8),
     headers: *?std.StringHashMap([]const u8),
+    env: *?std.StringHashMap([]const u8),
 ) !void {
     var srv = config.Server{
         .name = name,
@@ -446,6 +513,7 @@ fn appendTomlServer(
         .url = url,
         .transport = transport,
         .headers = headers.*,
+        .env = env.*,
     };
     if (args.items.len > 0) {
         srv.args = try args.toOwnedSlice(alloc);
@@ -455,7 +523,9 @@ fn appendTomlServer(
     try out.append(alloc, try srv.dupe(alloc));
     alloc.free(srv.args);
     if (srv.headers) |*h| h.deinit();
+    if (srv.env) |*e| e.deinit();
     headers.* = null;
+    env.* = null;
 }
 
 fn parseTomlHeaders(
@@ -611,6 +681,7 @@ fn mergeTomlMcpServers(alloc: std.mem.Allocator, doc: []const u8, servers: []con
             try out.appendSlice(alloc, "]\n");
         }
         if (s.headers) |headers| try appendTomlHeaders(alloc, &out, headers);
+        if (s.env) |env| try appendTomlEnv(alloc, &out, env);
         if (s.transport) |t| {
             try out.print(alloc, "transport = \"{s}\"\n", .{t});
         }
@@ -629,6 +700,25 @@ fn appendTomlHeaders(
 
     try out.appendSlice(alloc, "headers = { ");
     var it = headers.iterator();
+    var i: usize = 0;
+    while (it.next()) |entry| : (i += 1) {
+        if (i > 0) try out.appendSlice(alloc, ", ");
+        try out.print(alloc, "\"{s}\" = \"{s}\"", .{ entry.key_ptr.*, entry.value_ptr.* });
+    }
+    try out.appendSlice(alloc, " }\n");
+}
+
+fn appendTomlEnv(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayList(u8),
+    env: std.StringHashMap([]const u8),
+) !void {
+    if (env.count() == 0) return;
+
+    // Inline table form (valid TOML, accepted by Codex). mcpsync reads back both
+    // this inline form and Codex's native `[mcp_servers.NAME.env]` sub-table.
+    try out.appendSlice(alloc, "env = { ");
+    var it = env.iterator();
     var i: usize = 0;
     while (it.next()) |entry| : (i += 1) {
         if (i > 0) try out.appendSlice(alloc, ", ");
@@ -662,6 +752,7 @@ fn writeMcpServersForTarget(writer: anytype, servers: []const config.Server, tar
         if (s.url) |u| try writeJsonStringField(writer, "url", u, &wrote_field);
         if (s.args.len > 0) try writeJsonStringArrayField(writer, "args", s.args, &wrote_field);
         if (s.headers) |headers| try writeJsonHeadersField(writer, "headers", headers, &wrote_field);
+        if (s.env) |env| try writeJsonHeadersField(writer, "env", env, &wrote_field);
         if (!is_claude) {
             if (s.transport) |t| try writeJsonStringField(writer, "transport", t, &wrote_field);
         }
@@ -824,4 +915,56 @@ fn findKeyValueRange(alloc: std.mem.Allocator, doc: []const u8, key: []const u8)
         }
     }
     return null;
+}
+
+test "readServersToml: env sub-table is captured, not a phantom server" {
+    const alloc = std.testing.allocator;
+    const toml =
+        \\[mcp_servers.foo]
+        \\command = "/usr/bin/foo"
+        \\args = ["serve"]
+        \\
+        \\[mcp_servers.foo.env]
+        \\API_KEY = "secret"
+        \\REGION = "us-east"
+        \\
+    ;
+    var servers: std.ArrayList(config.Server) = .empty;
+    defer {
+        for (servers.items) |*s| s.free(alloc);
+        servers.deinit(alloc);
+    }
+    try readServersToml(alloc, toml, &servers);
+
+    // Exactly one server "foo" — no phantom "foo.env".
+    try std.testing.expectEqual(@as(usize, 1), servers.items.len);
+    try std.testing.expectEqualStrings("foo", servers.items[0].name);
+    const env = servers.items[0].env orelse return error.EnvLost;
+    try std.testing.expectEqualStrings("secret", env.get("API_KEY").?);
+    try std.testing.expectEqualStrings("us-east", env.get("REGION").?);
+
+    // Writing back must not produce a quoted phantom and must keep env.
+    const doc = try mergeTomlMcpServers(alloc, "", servers.items);
+    defer alloc.free(doc);
+    try std.testing.expect(std.mem.indexOf(u8, doc, "\"foo.env\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, doc, "API_KEY") != null);
+}
+
+test "readServersToml: inline env = { ... } round-trips" {
+    const alloc = std.testing.allocator;
+    const toml =
+        \\[mcp_servers.bar]
+        \\command = "/bar"
+        \\env = { "TOKEN" = "t" }
+        \\
+    ;
+    var servers: std.ArrayList(config.Server) = .empty;
+    defer {
+        for (servers.items) |*s| s.free(alloc);
+        servers.deinit(alloc);
+    }
+    try readServersToml(alloc, toml, &servers);
+    try std.testing.expectEqual(@as(usize, 1), servers.items.len);
+    const env = servers.items[0].env orelse return error.EnvLost;
+    try std.testing.expectEqualStrings("t", env.get("TOKEN").?);
 }
