@@ -29,6 +29,11 @@ pub const Server = struct {
     url: ?[]const u8 = null,
     /// Optional per-server HTTP headers, e.g. Authorization tokens.
     headers: ?std.StringHashMap([]const u8) = null,
+    /// Optional per-server environment variables, e.g. API keys. Stored as a
+    /// string map like headers; Codex represents these as a nested
+    /// [mcp_servers.NAME.env] sub-table. Must be preserved on round-trip —
+    /// dropping it silently wipes a user's secrets.
+    env: ?std.StringHashMap([]const u8) = null,
     /// Optional explicit transport hint (e.g. "stdio", "sse", "http")
     transport: ?[]const u8 = null,
 
@@ -36,6 +41,7 @@ pub const Server = struct {
         var s = self;
         s.name = try alloc.dupe(u8, self.name);
         s.headers = null;
+        s.env = null;
         if (self.command) |c| s.command = try alloc.dupe(u8, c);
         if (self.url) |u| s.url = try alloc.dupe(u8, u);
         if (self.transport) |t| s.transport = try alloc.dupe(u8, t);
@@ -56,6 +62,20 @@ pub const Server = struct {
             }
             s.headers = headers_copy;
         }
+        if (self.env) |env| {
+            var env_copy = std.StringHashMap([]const u8).init(alloc);
+            errdefer freeHeaderMap(&env_copy, alloc);
+
+            var it = env.iterator();
+            while (it.next()) |entry| {
+                const key = try alloc.dupe(u8, entry.key_ptr.*);
+                errdefer alloc.free(key);
+                const value = try alloc.dupe(u8, entry.value_ptr.*);
+                errdefer alloc.free(value);
+                try env_copy.put(key, value);
+            }
+            s.env = env_copy;
+        }
         return s;
     }
 
@@ -65,6 +85,7 @@ pub const Server = struct {
         if (self.url) |u| alloc.free(u);
         if (self.transport) |t| alloc.free(t);
         if (self.headers) |*headers| freeHeaderMap(headers, alloc);
+        if (self.env) |*env| freeHeaderMap(env, alloc);
         for (self.args) |a| alloc.free(a);
         alloc.free(self.args);
     }
@@ -76,6 +97,7 @@ pub const Server = struct {
         if (!strEql(self.url, other.url)) return false;
         if (!std.mem.eql(u8, self.effectiveTransport(), other.effectiveTransport())) return false;
         if (!headersEql(self.headers, other.headers)) return false;
+        if (!headersEql(self.env, other.env)) return false;
         if (self.args.len != other.args.len) return false;
         for (self.args, other.args) |a, b| {
             if (!std.mem.eql(u8, a, b)) return false;
@@ -252,10 +274,26 @@ fn parseRegistry(alloc: std.mem.Allocator, text: []const u8) !Registry {
                 headers.deinit();
             }
         };
+        if (obj.object.get("env")) |v| if (v == .object) {
+            var env = std.StringHashMap([]const u8).init(alloc);
+            var env_it = v.object.iterator();
+            while (env_it.next()) |env_entry| {
+                const ev = env_entry.value_ptr.*;
+                if (ev == .string) {
+                    try env.put(env_entry.key_ptr.*, ev.string);
+                }
+            }
+            if (env.count() > 0) {
+                srv.env = env;
+            } else {
+                env.deinit();
+            }
+        };
 
         try reg.add(srv);
         alloc.free(srv.args);
         if (srv.headers) |*headers| headers.deinit();
+        if (srv.env) |*env| env.deinit();
     }
 
     return reg;
@@ -293,6 +331,7 @@ fn writeMcpServers(writer: anytype, reg: *const Registry) !void {
         if (s.url) |u| try writeJsonStringField(writer, "url", u, &wrote_field);
         if (s.args.len > 0) try writeJsonStringArrayField(writer, "args", s.args, &wrote_field);
         if (s.headers) |headers| try writeJsonHeadersField(writer, "headers", headers, &wrote_field);
+        if (s.env) |env| try writeJsonHeadersField(writer, "env", env, &wrote_field);
         if (s.transport) |t| try writeJsonStringField(writer, "transport", t, &wrote_field);
         if (wrote_field) try writer.writeByte('\n');
 
